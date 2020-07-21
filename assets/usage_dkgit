@@ -1,0 +1,37 @@
+
+        Welcome to use:
+
+               ██████╗ ██╗  ██╗ ██████╗ ██╗████████╗ 
+               ██╔══██╗██║ ██╔╝██╔════╝ ██║╚══██╔══╝ 
+               ██║  ██║█████╔╝ ██║  ███╗██║   ██║    
+               ██║  ██║██╔═██╗ ██║   ██║██║   ██║    
+               ██████╔╝██║  ██╗╚██████╔╝██║   ██║    
+               ╚═════╝ ╚═╝  ╚═╝ ╚═════╝ ╚═╝   ╚═╝    
+
+        You can try it now, use " dkgit publish -d "....  
+        Now, show the usage for you:
+        
+        版本发布（deploy）：
+            -d :
+                将功能功能分支同步主干后合并到develop并推送至远程仓库
+                使用示例： dkgit deploy -d
+
+            -p : 
+                将功能分支同步主干后合并到preview并推送至远程仓库
+                使用示例：dkgit deploy -p
+
+        分支对齐(clean)：
+            将功能分支强制和主干对齐,该功能只能用在develop和preview分支,相当于: git fetch && git reset origin/master --hard
+            使用示例:dkgit clean 
+        
+        同步主干(sync)：
+            在功能分支同步origin/master, 等价于：git fetch && git rebase -i origin/master
+            使用示例：dkgit sync
+
+        切换分支(checkout)：
+            切换或创建一个新的分支..注意，此处是强制切换到origin分支
+            使用示例: dkgit checkout -b  branch_name
+
+        查看变更状态(review):
+            展示本地的分支较其他分支的修改状态.
+            使用示例: dkgit review -b develop

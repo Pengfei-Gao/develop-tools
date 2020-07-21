@@ -1,0 +1,445 @@
+#!/bin/bash
+
+source $(dirname $0)/deps/commmon.sh
+
+MODULE_NAME=$(basename $(pwd))
+
+DEPLOY_INI=$(dirname $0)/conf/dkgit.ini 
+
+DEVELOP_BRANCH=$(config $DEPLOY_INI branch develop)
+PREVIEW_BRANCH=$(config $DEPLOY_INI branch preview)
+RELEASE_BRANCH=$(config $DEPLOY_INI branch release)
+CONFLICT_FLAG=$(config $DEPLOY_INI conflict conflict_flag)
+IS_CLEAR=false
+
+PROTECT_BRANCH=(
+    $DEVELOP_BRANCH 
+    $PREVIEW_BRANCH 
+    $RELEASE_BRANCH
+) 
+
+ACTION_LIST=(
+    deploy
+    clean
+    checkout
+    sync
+    review
+    help
+)
+
+function error_log(){
+    echo -en "\\033[1;31m$*\\033[m"
+}
+
+function warn_log(){
+  echo -en "\\033[3;38;5;206m$*\\033[m"
+}
+
+function info_log(){
+  echo -en "\\033[32m$*\\033[m"
+}
+
+function in_array(){
+    local value=$1   # 入参 值
+    local arr=${@:2} # 入参 数组
+    for var in ${arr[@]} ; do
+        [ "$(echo $var | trim)" = "$(echo $value | trim)" ] && return 0
+    done
+    return 1
+}
+
+# 获取当前分支名
+function get_current_branch_name(){
+    echo $(git symbolic-ref --short HEAD)
+}
+
+# 检测当前分支是否合法
+function check_branch_valid(){
+    local branch_name=$1   # 入参，分支名称
+    info_log "开始发布到 $MODE 分支...\n"
+    while in_array "$branch_name" ${PROTECT_BRANCH[@]} || ! in_array "$branch_name" "$(git branch)"; do
+        error_log "😨 当前或选择的分支为 $branch_name , 该分支不存在或受到保护，请选择合适的功能分支来发布：\n "
+        echo "$(git branch)"
+        printf "🙄 请输入合法的分支名："
+        read branch_name
+    done
+    
+
+    warn_log "👹 当前分支 ($branch_name) 修改对比 $MODE  如下：\n"
+    show_diff_stat $branch_name $(config $DEPLOY_INI branch $(echo $MODE | tr '[A-Z]' '[a-z]'))
+
+
+    local continue=y
+    warn_log "👹 确定要继续发布 $branch_name 到 $MODE 分支（y/n）？"
+    read continue
+    [ "$continue" = "n" ] && {
+        info_log "😌 开始重新选择目标功能分支.........\n" 
+        check_branch_valid
+    } || {
+        info_log "👹👻 继续发布选中的 $branch_name 到 $MODE 分支"
+    }
+
+    git checkout $branch_name && info_log "😎 分支切换成功！\n" || { 
+        error_log "😰 完蛋了，分支切换失败了, 有可能是当前分支有改动未提交导致的，提交后重试一下吧...\n"
+        exit
+    }
+}
+
+# 拉取上游分支，并且重置基线（以上游分支为准）
+function fetch_and_reset_hard(){
+    local branch_name=$(get_current_branch_name)
+    info_log "😈 开始拉取同步上流分支 (git fetch)...\n"
+    { 
+        git fetch && git reset origin/$branch_name --hard 
+    } && {
+        info_log "👻 拉取同步分支成功 (git reset origin/$branch_name --hard) ！\n"
+    } || {
+        error_log "😨 拉取同步失败，开始重试... \n"
+        fetch_and_reset_hard
+    }
+}
+
+function push_branch(){
+    desc_branch=$1
+    git push && {
+        info_log "😈 开始提交代码到 $desc_branch...(git push)  \n" 
+    } && {
+        info_log "👻 发布成功...  \n" 
+    } || {
+        info_log "😰 发布失败...开始重试  \n"
+    }
+}
+
+
+function handle_unmerged_file(){
+    for file in $(git ls-files --unmerged | awk -F " " '{print $4}' | sort | uniq); do
+        info_log "开始合并 $file .... \n"
+        for ((;;)); do
+            vim $file +/"$CONFLICT_FLAG"
+            info_log "文件 $file 合并后的diff展示如下：\n"
+            git diff $file
+            info_log "该文件是否合并完成 (y/n)?"
+            read right
+            [ "$right" == "y" ] && {
+                break
+            }
+        done
+        git add $file
+    done
+}
+
+# 合并功能分支，并且发布
+function merge_and_publish(){
+    local desc_branch=$1        # 入参,目标分支 develop master preview
+    local function_branch=$2    # 入参功能分支
+    
+    git checkout $function_branch && {
+        info_log "😈 开始同步远端的 remote/origin/$function_branch...(git checkout $function_branch)  \n"
+        fetch_and_reset_hard
+    } || {
+        error_log "😨 分支 $function_branch  切换或失败，请将本地修改提交或暂存后重试"
+        exit
+    }
+    
+    git checkout $desc_branch && {
+        info_log "😈 开始同步远端的 remote/origin/$desc_branch...(git checkout $desc_branch)  \n"
+        fetch_and_reset_hard
+    } || {
+        error_log "😨 分支 $function_branch  切换或失败，请将本地修改提交或暂存后重试"
+        exit
+    }
+
+    git merge $function_branch && {
+        info_log "😈 开始合并{$function_branch -> $desc_branch}... (git merge $function_branch) \n" &&
+        git merge $function_branch
+    } || {
+        error_log "😨 合并分支{$function_branch -> $desc_branch} 失败, 开始解决冲突："
+        handle_unmerged_file
+        git merge --continue
+        exit
+    }
+    
+    push_branch $desc_branch
+}
+
+function stash_local_modify(){
+    stash_success=1
+    if [ -n "$(git status -s)" ]; then
+        info_log "😇 检测到本地修改，暂时压入暂存栈 \n"
+        git stash
+        stash_success=0
+    fi
+}
+
+function pop_local_stash_modify(){
+    if [ $stash_success -eq 0 ]; then
+        info_log "😇 从暂存栈弹出本地修改.... \n"
+        git stash pop
+    fi
+}
+
+# 和上游分支对齐，同步remote/origin/master
+function fetch_and_rebase_master(){
+    stash_local_modify
+    info_log "😈 开始同步主分支...(git fetch && git rebase -i origin/master)\n"
+    git fetch  && git rebase -i origin/master && {
+        info_log "👹👺  同步master成功... \n"
+        info_log "👹👺  强制更新当前分支... \n"
+        git push -f
+        info_log "👻 主干更新成功... \n"
+    } || {
+        error_log "😖 完蛋了，同步主分支失败，可能是产生了冲突，开始解决冲突:"
+        handle_unmerged_file
+        git rebase --continue || git rebase --skip
+    }
+    pop_local_stash_modify
+}
+
+# 将代码发布到测试机(合并到develop)
+function publish_develop(){
+    check_branch_valid $(get_current_branch_name)
+    fetch_and_reset_hard                                             # 拉取并重置到远程分支
+    #fetch_and_rebase_master                                          # 同步master
+    merge_and_publish $DEVELOP_BRANCH $(get_current_branch_name)     # 合并并发布
+}
+
+# 将代码发布到预览机器(合并到preview)
+function publish_preview(){
+    check_branch_valid $(get_current_branch_name)
+    fetch_and_reset_hard $(get_current_branch_name)
+    #fetch_and_rebase_master
+    merge_and_publish $PREVIEW_BRANCH $(get_current_branch_name)     # 合并并发布
+}
+
+# 将代码发布到生产环境(合并到master)
+function publish_production(){
+    check_branch_valid $(get_current_branch_name)
+    fetch_and_reset_hard $(get_current_branch_name)
+    fetch_and_rebase_master
+    merge_and_publish $RELEASE_BRANCH $(get_current_branch_name)     # 合并并发布
+}
+
+
+function show_usage(){
+    cat $(dirname $0)/assets/usage_dkgit
+    exit;
+}
+
+
+# 强制指定分支和master对齐
+function clean_branch(){
+    local branch=$1
+    [ -z "$branch_name" ] && {
+        local branch=$(get_current_branch_name)
+    }
+    while ! in_array "$branch" ${PROTECT_BRANCH[@]} || ! in_array "$branch" "$(git branch)"; do
+        error_log "😨 当前或选择的分支为 $branch , 该分支不存在或受到保护，clean 功能仅限在 ${PROTECT_BRANCH[@]} 分支上使用：\n "
+        echo "$(git branch)"
+        printf "🙄 请输入合法的分支名："
+        read branch_name
+    done
+    warn_log "👹 确定要将 $branch 分支强制reset到  origin/master (y/n) ?"
+    read reset_hard
+    if [ $reset_hard = "n" ]; then
+        info_log "😴 退出 clean 操作..."
+        exit
+    fi
+    info_log "😈 开始对齐 $branch 到主干... \n"
+    {
+        git checkout $branch &&
+        git fetch  &&
+        git reset origin/master --hard  &&
+        git push -f --set-upstream origin $branch
+    } && { 
+        info_log "👻 对齐成功... \n"
+    } || {
+        error_log "😰 对齐失败，开始重试... \n"
+        clean_branch $branch
+    }
+}
+
+function show_diff_stat(){
+    local origin=$1
+    local compire=$2
+    if [ -z "$compire" ]; then
+        local compire="origin/master"
+    fi
+    git diff --stat $origin $compire
+}
+
+
+
+function publish_branch(){
+    [ -z $MODE ] && show_usage
+    case $MODE in
+        DEVELOP)
+            publish_develop
+            ;;
+        PREVIEW)
+            publish_preview
+            ;;
+        RELEASE)
+            #publish_production
+            ;;
+    esac
+}
+
+function checkout_remote_origin_branch(){
+    local branch_name=$1
+    [ -z "$branch_name" ] && {
+        error_log "请使用 -b 参数指定具体分支... \n"
+        show_usage
+    }
+    stash_local_modify # 将本地修改压入暂存
+    info_log "😈 开始拉取远程分支.(git fetch)... \n"
+    if git fetch; then
+        info_log "👹 拉取成功,强制检出到 origin/$branch_name...(git reset origin/$branch_name --hard).... \n"
+        if in_array $branch_name $(git branch) ; then
+            info_log "😈 检出已存在的分支$branch_name... git checkout $branch_name && git reset origin/$branch_name --hard ...... \n"
+            git checkout $branch_name
+            git reset origin/$branch_name --hard
+        else
+            warn_log "🙄 输入的分支 $branch_name  不存在，是否需要创建新分支(y/n)?"
+            read create_branch
+            [ "$create_branch" == "y" ] && {
+                info_log "😡 创建新分支 $branch_name ... git checkout -b $branch_name ...... \n"
+                git checkout -b $branch_name
+            }
+        fi
+        
+        if [ ! -z "$(git submodule status --)" ]; then
+            info_log "更新子模块..........\n"
+            git submodule init
+            git submodule update
+        fi
+
+        [ $? -eq 0 ] && info_log "👻 检出成功......... \n" || info_log "😨检出失败....\n"
+    else
+        error_log "😰 检出失败,开始重试... \n"
+        checkout_remote_origin_branch $branch_name
+    fi
+    pop_local_stash_modify
+}
+
+function rebase_remote_origin_branch(){
+    local branch_name=$1
+    info_log "😈 开始拉取远程分支.(git fetch)... \n"
+    git fetch && {
+        info_log "👹 拉取成功,强制检出到 origin/$branch_name...(git reset origin/$branch_name --hard).... \n"
+        git rebase -i origin/$branch_name && 
+        info_log "👻 同步成功......... \n" || 
+        error_log "😰 同步失败,开始重试... \n"
+    } || {
+        error_log "😰 同步失败,开始重试... \n"
+        checkout_remote_origin_branch $branch_name
+    }
+}
+
+
+function commit_local_changes(){
+    info_log "🤒 本地修改如下："
+    git diff
+    warn_log "是否继续提交(y/n)？"
+    read is_commit
+    if [ "$is_commit" != "n" ]; then
+        git add .
+    else
+        info_log "退出提交流程..."
+        exit
+    fi
+    if [ -z "$COMMIT_MSG" ]; then
+        git commit 
+    else
+        git commit -m "$COMMIT_MSG"
+    fi
+    git push  --set-upstream origin $(get_current_branch_name)
+}
+
+# 检查是否是git目录
+function must_be_git_project(){
+    if git status ;  then
+        return 1
+    else
+        error_log "🤣 当前目录不是一个合法的git目录......."
+        return 0
+    fi
+}
+
+
+function init_args(){
+    while getopts "dprchb:m:" arg
+    do
+        case $arg in
+            d) 
+                MODE="DEVELOP"  
+                ;;
+            p) 
+                MODE="PREVIEW"  
+                ;;
+            #r) 
+            #    MODE="RELEASE"  
+            #    ;;
+            c) 
+                IS_CLEAR=true 
+                ;;
+            h) 
+                show_usage
+                ;;
+            m) 
+                COMMIT_MSG=${@:2}
+                ;;
+            b) 
+                TARGET_BRANCH_NAME=$OPTARG
+                ;;
+            ?)  
+                show_usage
+                ;;
+        esac
+    done
+}
+
+
+
+
+# 初始化参数
+ACTION=$1
+in_array "$ACTION" ${ACTION_LIST[@]} &&  init_args ${@:2}
+
+[ -z "$ACTION" ] && {
+    show_usage
+}
+
+case $ACTION in
+    deploy)
+        must_be_git_project && exit
+        publish_branch
+        ;;
+    clean)
+        must_be_git_project && exit
+        clean_branch $(get_current_branch_name)
+        ;;
+    checkout)
+        must_be_git_project && exit
+        [ -z "$TARGET_BRANCH_NAME" ] && TARGET_BRANCH_NAME=$2
+        checkout_remote_origin_branch $TARGET_BRANCH_NAME
+        ;;
+    sync)
+        must_be_git_project && exit
+        fetch_and_rebase_master
+        ;;
+#    commit)
+#        must_be_git_project && exit
+#        commit_local_changes
+#        ;;
+    review)
+        must_be_git_project && exit
+        show_diff_stat $(get_current_branch_name) $TARGET_BRANCH_NAME
+        ;;
+    help)
+        show_usage
+        ;;
+    *)  
+        git "${@:1}"
+        ;;
+esac
+
